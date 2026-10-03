@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>劃界戰記 - 邊線定位與速度修正版</title>
+    <style>
+        * { box-sizing: border-box; touch-action: none; user-select: none; }
+        body { margin: 0; background: #0b0c10; color: #fff; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: space-between; height: 100vh; overflow: hidden; }
+        #game-container { position: relative; width: 100vw; height: 100vh; max-width: 480px; display: flex; flex-direction: column; align-items: center; justify-content: space-between; padding: 10px; }
+        #ui-bar { width: 100%; display: flex; justify-content: space-between; align-items: center; padding: 8px 14px; background: #1f2833; border-radius: 8px; font-weight: bold; font-size: 14px; }
+        .progress-container { width: 100px; height: 12px; background: #0b0c10; border-radius: 6px; overflow: hidden; border: 1px solid #66fcf1; }
+        .progress-bar { height: 100%; width: 0%; background: #66fcf1; transition: width 0.2s; }
+        #canvas-wrapper { position: relative; flex-grow: 1; width: 100%; height: 42vh; display: flex; align-items: center; justify-content: center; }
+        #gameCanvas { width: 100%; height: 100%; object-fit: contain; background: #05060a; border: 2px solid #45a29e; border-radius: 8px; }
+        #joystick-wrapper { display: flex; flex-direction: column; align-items: center; margin-bottom: 6px; }
+        #joystick-container { width: 160px; height: 160px; }
+        #joystickCanvas { width: 100%; height: 100%; }
+        #status-bar { width: 100%; display: flex; justify-content: space-between; font-size: 12px; color: #66fcf1; margin-top: 4px; font-weight: bold; padding: 0 4px; }
+        #overlay { position: absolute; inset: 0; background: rgba(11, 12, 16, 0.94); display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 20px; text-align: center; z-index: 100; }
+        .start-btn { padding: 12px 36px; font-size: 18px; font-weight: bold; background: #66fcf1; border: none; border-radius: 25px; color: #0b0c10; cursor: pointer; }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <div id="ui-bar">
+        <div>佔領: <span id="percent-text">0</span>% / 85%</div>
+        <div class="progress-container"><div id="progress-bar" class="progress-bar"></div></div>
+    </div>
+    
+    <div id="canvas-wrapper"><canvas id="gameCanvas" width="360" height="480"></canvas></div>
+    
+    <div id="joystick-wrapper">
+        <div id="joystick-container"><canvas id="joystickCanvas" width="200" height="200"></canvas></div>
+        <div id="status-bar">
+            <span id="speed-text">當前速度：待機</span>
+            <span id="boss-text">魔王：母體</span>
+        </div>
+    </div>
+
+    <div id="overlay">
+        <h2>劃界戰記</h2>
+        <p>• <b>嚴格邊線限制</b>：光球貼壓邊線移動，不進入佔領內部<br>• <b>搖桿速度修正</b>：1、2 段為慢速，3 段為中速<br>• 起始 0% 佔領度，劃地達 85% 通關！</p>
+        <button class="start-btn" id="start-btn">開始遊戲</button>
+    </div>
+</div>
+
+<script>
+// 自訂速度與搖桿參數
+const CONFIG = { SPEED_SLOW: 5, SPEED_MEDIUM: 2, DEADZONE: 12, STAGE1: 35, STAGE2: 60 };
+
+const canvas = document.getElementById('gameCanvas'), ctx = canvas.getContext('2d');
+const joyCanvas = document.getElementById('joystickCanvas'), joyCtx = joyCanvas.getContext('2d');
+
+const COLS = 36, ROWS = 48, GRID = 10, TARGET = 85, BORDER = 2;
+let grid = [], path = [], moveCounter = 0, speedInterval = CONFIG.SPEED_SLOW;
+
+// 光球初始精準放置於頂部邊線上
+let player = { x: 18, y: BORDER - 1, dx: 0, dy: 0, isDrawing: false };
+
+let bosses = [], splitTimer = 0, nextSplitTime = 300;
+let isGameOver = false, isGameWon = false;
+
+// 搖桿設定
+const joyCenter = { x: 100, y: 100 }, joyRadius = 90;
+let stickPos = { ...joyCenter }, isDragging = false, activeDir = -1, activeStage = 0;
+
+function resetGame() {
+    // 建立地圖：1 為外圍護城邊界與安全區，0 為危險區
+    grid = Array.from({ length: ROWS }, (_, r) => 
+        Array.from({ length: COLS }, (_, c) => (r < BORDER - 1 || r >= ROWS - BORDER + 1 || c < BORDER - 1 || c >= COLS - BORDER + 1) ? 1 : 0)
+    );
+
+    player = { x: 18, y: BORDER - 1, dx: 0, dy: 0, isDrawing: false };
+    path = [];
+
+    let a = Math.random() * Math.PI / 2 + Math.PI / 4;
+    bosses = [{ id: Math.random(), x: 180, y: 240, vx: Math.cos(a) * 2.4, vy: Math.sin(a) * 2.4, speed: 2.4, radius: 15, angle: 0, time: Math.random() * 100, coolDown: 0 }];
+
+    splitTimer = 0; nextSplitTime = 360 + Math.random() * 240;
+    isGameOver = isGameWon = false;
+    calculateProgress(); resetJoystick();
+    document.getElementById('overlay').style.display = 'none';
+}
+
+// 【修復重點】：判定該網格是否為「交界邊線Tile」（為已佔領 1 且四周至少有 1 個 0）
+function isEdgeTile(x, y) {
+    if (x < 0 || x >= COLS || y < 0 || y >= ROWS) return false;
+    if (grid[y][x] !== 1) return false;
+
+    // 如果是地圖邊框最外層，算邊線
+    if (x === BORDER - 1 || x === COLS - BORDER || y === BORDER - 1 || y === ROWS - BORDER) return true;
+
+    // 四周方向只要有 0，代表此 1 號網格是邊線；若四周全是 1，則是內部（禁止進入）
+    let dirs = [{x:0,y:1},{x:0,y:-1},{x:1,y:0},{x:-1,y:0}];
+    return dirs.some(d => {
+        let nx = x + d.x, ny = y + d.y;
+        return nx >= 0 && nx < COLS && ny >= 0 && ny < ROWS && grid[ny][nx] === 0;
+    });
+}
+
+function update() {
+    if (isGameOver || isGameWon) return;
+
+    // 1. 光球移動邏輯
+    if (activeStage > 0 && ++moveCounter % speedInterval === 0 && (player.dx || player.dy)) {
+        let nx = player.x + player.dx;
+        let ny = player.y + player.dy;
+
+        if (nx >= 0 && nx < COLS && ny >= 0 && ny < ROWS) {
+            let next = grid[ny][nx];
+
+            if (!player.isDrawing) {
+                // 尚未劃線狀態：只能在邊線 (EdgeTile) 上移動，或是向內進入未佔領區 (0) 劃線
+                if (next === 1) {
+                    if (isEdgeTile(nx, ny)) { // 強制光球只壓在邊線上，禁止深入佔領內部
+                        player.x = nx; player.y = ny;
+                    }
+                } else if (next === 0) {
+                    // 朝未佔領區移動：開始劃線
+                    player.isDrawing = true;
+                    path = [{ x: player.x, y: player.y }, { x: nx, y: ny }];
+                    player.x = nx; player.y = ny;
+                }
+            } else {
+                // 正在劃線狀態
+                let hitIdx = path.findIndex(p => p.x === nx && p.y === ny);
+                if (hitIdx !== -1) {
+                    // 自撞截斷修復
+                    path = path.slice(0, hitIdx + 1);
+                    player.x = path[path.length - 1].x;
+                    player.y = path[path.length - 1].y;
+                } else {
+                    path.push({ x: nx, y: ny });
+                    player.x = nx; player.y = ny;
+
+                    // 接回安全區 (1)，完成封閉
+                    if (next === 1) {
+                        player.isDrawing = false;
+                        fillClosedArea();
+                        path = [];
+                        player.dx = player.dy = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. 魔王移動與精確邊界彈跳
+    bosses.forEach(b => {
+        if (b.coolDown > 0) b.coolDown--;
+        b.time += 0.04; b.angle += 0.05;
+        let nx = b.x + b.vx + Math.sin(b.time * 1.2) * 0.4;
+        let ny = b.y + b.vy + Math.cos(b.time * 0.9) * 0.4;
+
+        let checkR = b.radius + 1;
+        let gx1 = Math.floor((nx + (b.vx > 0 ? checkR : -checkR)) / GRID);
+        let gy1 = Math.floor((ny + (b.vy > 0 ? checkR : -checkR)) / GRID);
+        let gy = Math.floor(b.y / GRID), gx = Math.floor(b.x / GRID);
+
+        if (gx1 <= BORDER - 2 || gx1 >= COLS - BORDER + 1 || grid[gy]?.[gx1] === 1) {
+            let ra = Math.PI - Math.atan2(b.vy, b.vx) + (Math.random() - 0.5) * 0.5;
+            b.vx = Math.cos(ra) * b.speed; b.vy = Math.sin(ra) * b.speed;
+        } else b.x = nx;
+
+        if (gy1 <= BORDER - 2 || gy1 >= ROWS - BORDER + 1 || grid[gy1]?.[gx] === 1) {
+            let ra = -Math.atan2(b.vy, b.vx) + (Math.random() - 0.5) * 0.5;
+            b.vx = Math.cos(ra) * b.speed; b.vy = Math.sin(ra) * b.speed;
+        } else b.y = ny;
+    });
+
+    // 3. 魔王隨機時間分裂
+    if (++splitTimer >= nextSplitTime && bosses.length < 4) {
+        splitTimer = 0; nextSplitTime = 480 + Math.random() * 300;
+        bosses.sort((a,b) => b.radius - a.radius);
+        let p = bosses[0];
+        if (p && p.radius >= 10) {
+            let nr = Math.max(9, p.radius * 0.7);
+            p.radius = nr; p.coolDown = 120;
+            let pa = Math.atan2(p.vy, p.vx), sa = pa + Math.PI/3, sb = pa - Math.PI/3;
+            p.vx = Math.cos(sa) * p.speed; p.vy = Math.sin(sa) * p.speed;
+            bosses.push({ id: Math.random(), x: p.x + Math.cos(sb) * (nr*2), y: p.y + Math.sin(sb) * (nr*2), vx: Math.cos(sb) * p.speed, vy: Math.sin(sb) * p.speed, speed: p.speed, radius: nr, angle: 0, time: Math.random() * 100, coolDown: 120 });
+        }
+    }
+
+    // 4. 超半徑磁吸與合併
+    for (let i = 0; i < bosses.length; i++) {
+        for (let j = i + 1; j < bosses.length; j++) {
+            let b1 = bosses[i], b2 = bosses[j];
+            if (b1.coolDown === 0 && b2.coolDown === 0) {
+                let d = Math.hypot(b2.x - b1.x, b2.y - b1.y), td = b1.radius + b2.radius;
+                if (d < td * 0.85) {
+                    b1.radius = Math.min(20, Math.sqrt(b1.radius**2 + b2.radius**2));
+                    b1.vx = (b1.vx + b2.vx) * 0.55; b1.vy = (b1.vy + b2.vy) * 0.55; b1.coolDown = 60;
+                    bosses.splice(j--, 1);
+                } else if (d < td * 2.2) {
+                    let pull = 0.2;
+                    b1.vx += ((b2.x - b1.x) / d) * pull; b1.vy += ((b2.y - b1.y) / d) * pull;
+                    b2.vx += ((b1.x - b2.x) / d) * pull; b2.vy += ((b1.y - b2.y) / d) * pull;
+                }
+            }
+        }
+    }
+
+    document.getElementById('boss-text').innerText = `魔王數量：${bosses.length} ${bosses.length < 4 ? '(分裂中)' : '(上限)'}`;
+
+    // 5. 碰撞偵測
+    bosses.forEach(b => {
+        let bx = Math.floor(b.x / GRID), by = Math.floor(b.y / GRID);
+        if (player.isDrawing && path.some(p => Math.hypot(b.x - (p.x * GRID + GRID/2), b.y - (p.y * GRID + GRID/2)) < b.radius + GRID/2)) triggerGameOver("劃線軌跡被魔王撞破！");
+        if (bx === player.x && by === player.y) triggerGameOver("正面撞上魔王！");
+    });
+}
+
+// 完美閉合填滿演算法
+function fillClosedArea() {
+    path.forEach(p => { grid[p.y][p.x] = 1; });
+
+    let visited = Array.from({ length: ROWS }, () => Array(COLS).fill(false));
+    let q = [];
+
+    bosses.forEach(b => {
+        let bx = Math.max(BORDER, Math.min(COLS - BORDER - 1, Math.floor(b.x / GRID)));
+        let by = Math.max(BORDER, Math.min(ROWS - BORDER - 1, Math.floor(b.y / GRID)));
+        if (!visited[by][bx] && grid[by][bx] === 0) {
+            visited[by][bx] = true;
+            q.push({ x: bx, y: by });
+        }
+    });
+
+    while (q.length > 0) {
+        let { x, y } = q.shift();
+        let dirs = [{x:0,y:1},{x:0,y:-1},{x:1,y:0},{x:-1,y:0}];
+        for (let d of dirs) {
+            let nx = x + d.x, ny = y + d.y;
+            if (nx >= 0 && nx < COLS && ny >= 0 && ny < ROWS) {
+                if (!visited[ny][nx] && grid[ny][nx] === 0) {
+                    visited[ny][nx] = true;
+                    q.push({ x: nx, y: ny });
+                }
+            }
+        }
+    }
+
+    for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+            if (grid[r][c] === 0 && !visited[r][c]) {
+                grid[r][c] = 1;
+            }
+        }
+    }
+
+    calculateProgress();
+}
+
+function calculateProgress() {
+    let total = (COLS - (BORDER - 1) * 2) * (ROWS - (BORDER - 1) * 2);
+    let claimed = 0;
+    for (let r = BORDER - 1; r < ROWS - BORDER + 1; r++) {
+        for (let c = BORDER - 1; c < COLS - BORDER + 1; c++) {
+            if (grid[r][c] === 1) claimed++;
+        }
+    }
+    let playable = (COLS - BORDER * 2) * (ROWS - BORDER * 2);
+    let actualClaimed = claimed - (total - playable);
+    let percent = Math.max(0, Math.floor((actualClaimed / playable) * 100));
+
+    document.getElementById('percent-text').innerText = percent;
+    document.getElementById('progress-bar').style.width = percent + '%';
+    if (percent >= TARGET) { isGameWon = true; showOverlay("通關成功！", `成功佔領 ${percent}%！`); }
+}
+
+function triggerGameOver(reason) { isGameOver = true; showOverlay("遊戲結束", reason); }
+function showOverlay(title, msg) {
+    document.getElementById('overlay').style.display = 'flex';
+    document.getElementById('overlay').querySelector('h2').innerText = title;
+    document.getElementById('overlay').querySelector('p').innerHTML = msg;
+}
+
+function drawPolygon(x, y, radius, sides, angle) {
+    ctx.beginPath();
+    for (let i = 0; i < sides; i++) {
+        let a = angle + i * 2 * Math.PI / sides;
+        ctx[i === 0 ? 'moveTo' : 'lineTo'](x + radius * Math.cos(a), y + radius * Math.sin(a));
+    }
+    ctx.closePath();
+}
+
+function draw() {
+    ctx.fillStyle = '#0a0c14'; ctx.fillRect(0, 0, 360, 480);
+
+    // 繪製地圖與佔領區
+    for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+            if (grid[r][c] === 1) { 
+                ctx.fillStyle = (r < BORDER - 1 || r >= ROWS - BORDER + 1 || c < BORDER - 1 || c >= COLS - BORDER + 1) ? '#101721' : '#1e3d59';
+                ctx.fillRect(c * GRID, r * GRID, GRID, GRID); 
+            }
+        }
+    }
+
+    // 繪製劃線軌跡 (亮藍色)
+    if (path.length > 1) {
+        ctx.strokeStyle = '#00f2fe'; ctx.lineWidth = 4; ctx.beginPath();
+        ctx.moveTo(path[0].x * GRID + GRID/2, path[0].y * GRID + GRID/2);
+        path.forEach(p => ctx.lineTo(p.x * GRID + GRID/2, p.y * GRID + GRID/2));
+        ctx.stroke();
+    }
+
+    // 光球視覺效果
+    let px = player.x * GRID + GRID/2, py = player.y * GRID + GRID/2;
+    ctx.fillStyle = 'rgba(102, 252, 241, 0.6)'; ctx.beginPath(); ctx.arc(px, py, 9, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#000'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(px, py, 7, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = '#ffea00'; ctx.beginPath(); ctx.arc(px, py, 6, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(px, py, 3, 0, Math.PI * 2); ctx.fill();
+
+    // 繪製魔王
+    bosses.forEach(b => {
+        ctx.fillStyle = b.coolDown > 0 ? 'rgba(0, 242, 254, 0.35)' : 'rgba(255, 0, 85, 0.25)';
+        drawPolygon(b.x, b.y, b.radius + 5, 16, b.angle); ctx.fill();
+        ctx.fillStyle = b.coolDown > 0 ? '#00f2fe' : '#ff0055'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.2;
+        drawPolygon(b.x, b.y, b.radius, 16, b.angle); ctx.fill(); ctx.stroke();
+    });
+}
+
+// 搖桿邏輯
+function drawJoystick() {
+    joyCtx.clearRect(0, 0, 200, 200);
+    [25, 50, 75].forEach((r, idx) => {
+        joyCtx.strokeStyle = (activeStage > idx) ? '#66fcf1' : '#2c3540';
+        joyCtx.lineWidth = 3; joyCtx.beginPath(); joyCtx.arc(100, 100, r, 0, Math.PI * 2); joyCtx.stroke();
+    });
+
+    [-Math.PI/2, 0, Math.PI/2, Math.PI].forEach((a, i) => {
+        let ax = 100 + 82 * Math.cos(a), ay = 100 + 82 * Math.sin(a);
+        joyCtx.save(); joyCtx.translate(ax, ay); joyCtx.rotate(a + Math.PI / 2);
+        joyCtx.fillStyle = (i === activeDir && activeStage > 0) ? '#66fcf1' : '#556270';
+        joyCtx.beginPath(); joyCtx.moveTo(0, -7); joyCtx.lineTo(6, 6); joyCtx.lineTo(-6, 6); joyCtx.closePath(); joyCtx.fill();
+        joyCtx.restore();
+    });
+
+    joyCtx.fillStyle = '#7a8a9e'; joyCtx.beginPath(); joyCtx.arc(stickPos.x, stickPos.y, 20, 0, Math.PI * 2); joyCtx.fill();
+    joyCtx.fillStyle = '#d4af37'; joyCtx.beginPath(); joyCtx.arc(stickPos.x, stickPos.y, 14, 0, Math.PI * 2); joyCtx.fill();
+}
+
+function handleJoy(cx, cy) {
+    let rect = joyCanvas.getBoundingClientRect();
+    let dx = (cx - rect.left) * (200 / rect.width) - 100, dy = (cy - rect.top) * (200 / rect.height) - 100;
+    let dist = Math.hypot(dx, dy), maxD = joyRadius - 15;
+
+    if (dist > maxD) { dx = (dx / dist) * maxD; dy = (dy / dist) * maxD; dist = maxD; }
+    stickPos = { x: 100 + dx, y: 100 + dy };
+
+    if (dist > CONFIG.DEADZONE) {
+        let angle = Math.atan2(dy, dx);
+        if (angle >= -Math.PI/4 && angle < Math.PI/4) activeDir = 1;
+        else if (angle >= Math.PI/4 && angle < 3*Math.PI/4) activeDir = 2;
+        else if (angle >= -3*Math.PI/4 && angle < -Math.PI/4) activeDir = 0;
+        else activeDir = 3;
+
+        // 【修正重點】：1、2 段皆為慢速，3 段為中速
+        if (dist > CONFIG.STAGE2) { 
+            activeStage = 3; speedInterval = CONFIG.SPEED_MEDIUM; // 3 段：中速
+        } else if (dist > CONFIG.STAGE1) { 
+            activeStage = 2; speedInterval = CONFIG.SPEED_SLOW;   // 2 段：慢速
+        } else { 
+            activeStage = 1; speedInterval = CONFIG.SPEED_SLOW;   // 1 段：慢速
+        }
+
+        player.dx = (activeDir === 1) ? 1 : ((activeDir === 3) ? -1 : 0);
+        player.dy = (activeDir === 2) ? 1 : ((activeDir === 0) ? -1 : 0);
+        document.getElementById('speed-text').innerText = `當前速度：${activeStage === 3 ? '中速' : '慢速'} (${activeStage}段)`;
+    } else {
+        activeDir = -1; activeStage = 0; player.dx = player.dy = 0;
+        document.getElementById('speed-text').innerText = `當前速度：待機`;
+    }
+    drawJoystick();
+}
+
+function resetJoystick() {
+    isDragging = false; stickPos = { ...joyCenter }; activeDir = -1; activeStage = 0; player.dx = player.dy = 0;
+    document.getElementById('speed-text').innerText = `當前速度：待機`;
+    drawJoystick();
+}
+
+joyCanvas.addEventListener('touchstart', e => { e.preventDefault(); isDragging = true; handleJoy(e.touches[0].clientX, e.touches[0].clientY); });
+joyCanvas.addEventListener('touchmove', e => { e.preventDefault(); if (isDragging) handleJoy(e.touches[0].clientX, e.touches[0].clientY); });
+joyCanvas.addEventListener('touchend', resetJoystick);
+joyCanvas.addEventListener('mousedown', e => { isDragging = true; handleJoy(e.clientX, e.clientY); });
+window.addEventListener('mousemove', e => { if (isDragging) handleJoy(e.clientX, e.clientY); });
+window.addEventListener('mouseup', () => { if (isDragging) resetJoystick(); });
+
+document.getElementById('start-btn').addEventListener('click', resetGame);
+function loop() { update(); draw(); requestAnimationFrame(loop); }
+drawJoystick(); resetGame(); loop();
+</script>
+</body>
+</html>
